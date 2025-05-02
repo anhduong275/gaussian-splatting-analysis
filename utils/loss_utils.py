@@ -35,6 +35,8 @@ class FusedSSIMMap(torch.autograd.Function):
         img1, img2 = ctx.saved_tensors
         C1, C2 = ctx.C1, ctx.C2
         grad, bp_time = fusedssim_backward(C1, C2, img1, img2, opt_grad)
+        print("BP time: ", bp_time)
+        
         return None, None, grad, None, bp_time
 
 def l1_loss(network_output, gt):

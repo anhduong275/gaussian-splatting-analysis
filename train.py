@@ -9,7 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+# imports for oscar information
 import os
+import subprocess, ctypes, re
+
+# imports for the training script
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -39,6 +43,34 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+
+# ----------------------- ADDITIONS FOR OSCAR -----------------------
+def get_gpu_name():
+    gpu_env = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(',')[0] or "0"
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi","--query-gpu=name","--format=csv,noheader","-i",gpu_env],
+            encoding="utf-8"
+        ).strip()
+    except:
+        return "<nvidia-smi error>"
+
+def get_cpu_model():
+    with open("/proc/cpuinfo") as f:
+        for line in f:
+            if line.startswith("model name"):
+                return line.split(":",1)[1].strip()
+    return "<unknown>"
+
+def get_slurm_features():
+    node = os.environ.get("SLURM_JOB_NODELIST")
+    if not node:
+        return None
+    out = subprocess.check_output(["scontrol","show","node", node], encoding="utf-8")
+    m = re.search(r"Features=(\S+)", out)
+    return m.group(1) if m else None
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -83,7 +115,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, tb_writer, iteration, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -116,7 +148,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, tb_writer, iteration, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -150,11 +182,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
        
-        bp_start.record()
 
-        _, _, _, _, bp_time = loss.backward()
-
-        bp_end.record()
+        loss.backward()
 
         iter_end.record()
 
@@ -173,11 +202,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             iter_elapsed = iter_start.elapsed_time(iter_end)
             render_elapsed = render_start.elapsed_time(render_end)
-            bp_elapsed = bp_time
-            k1_elapsed = render_pkg["k1_time"]
-            k2_elapsed = render_pkg["k2_time"]
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_elapsed, render_elapsed, bp_elapsed, k1_elapsed, k2_elapsed, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_elapsed, render_elapsed, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -233,15 +259,12 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_elapsed, render_elapsed, bp_elapsed, k1_elapsed, k2_elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_elapsed, render_elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', iter_elapsed, iteration)
         tb_writer.add_scalar('render_time', render_elapsed, iteration)
-        tb_writer.add_scalar('bp_time', bp_elapsed, iteration)
-        tb_writer.add_scalar('k1_time', k1_elapsed, iteration)
-        tb_writer.add_scalar('k2_time', k2_elapsed, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -297,6 +320,12 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+
+    print("GPU →", get_gpu_name())
+    print("CPU →", get_cpu_model())
+    feats = get_slurm_features()
+    if feats:
+        print("Slurm Features →", feats)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
