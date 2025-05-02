@@ -11,11 +11,16 @@
 # Requires: train.py in same dir.
 
 # Configuration
-GPUS=(a2 titanrtx quadrortx geforce3090 a5000 a5500)
-PARTS=(vnc gpu gpu gpu gpu gpu)
-CPUS=(amd intel intel amd amd amd)
+# GPUS=(a2 titanrtx quadrortx geforce3090 a5000 a5500)
+# PARTS=(vnc gpu gpu gpu gpu gpu)
+# CPUS=(amd intel intel amd amd amd)
+
+GPUS=(a2 titanrtx)
+PARTS=(vnc gpu)
+CPUS=(amd intel)
+
 MAX_PARALLEL=2
-POLL_INTERVAL=5
+POLL_INTERVAL=300
 
 declare -a JOBIDS=()
 
@@ -61,8 +66,18 @@ for i in "${!GPUS[@]}"; do
 #SBATCH -e ${gpu}-%j.err
 #SBATCH -N 1
 
-module load cuda python
-python3 train.py
+module purge
+unset LD_LIBRARY_PATH
+module load miniforge/23.11.0-0s
+source /oscar/runtime/software/external/miniforge/23.11.0-0/etc/profile.d/conda.sh
+module load cuda/11.8.0-lpttyok
+module load ninja
+
+conda activate gaussian_splatting
+
+cd gaussian-splatting-analysis
+python train.py -s ../mip_extra_scenes/flowers/ --iterations 30000 --name ${gpu}
+
 EOF
 )
   echo "Submitted ${gpu} test as job ${sbatch_id}"
