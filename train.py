@@ -26,6 +26,12 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+# imports for power draw information
+import time
+import threading
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -71,6 +77,42 @@ def get_slurm_features():
     m = re.search(r"Features=(\S+)", out)
     return m.group(1) if m else None
 
+# ----------------------- Energy consumption tools -----------------------
+class EnergyProfiler:
+    def __init__(self, tb_writer):
+        self.tb_writer = tb_writer
+        self.is_running = False
+        self.iteration = 0
+    
+    def get_power_draw(self):
+        try:
+            result = subprocess.run([
+                'nvidia-smi',
+                '--query-gpu=power.draw',
+                '--format=csv,noheader,nounits'
+            ], capture_output=True, text=True)
+            return float(result.stdout.strip())
+        except:
+            return None
+        
+    def poll(self):
+        while self.is_running:
+            power_draw = self.get_power_draw()
+            if power_draw is not None:
+                self.tb_writer.add_scalar('power_draw', power_draw, self.iteration)
+                self.iteration += 1
+            time.sleep(0.1) # check in every 10ms?
+            
+    def start(self):
+        self.is_running = True
+        self.thread = threading.Thread(target=self.poll, daemon=True)
+        self.thread.start()
+        
+    def stop(self):
+        self.is_running = False
+        self.thread.join()
+    
+    
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -79,6 +121,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    energy_profiler = EnergyProfiler(tb_writer)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -104,6 +147,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    energy_profiler.start()
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -236,6 +281,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                
+    energy_profiler.stop()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -260,7 +307,7 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_elapsed, render_elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
+    if tb_writer:    
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', iter_elapsed, iteration)
@@ -334,6 +381,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
